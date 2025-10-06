@@ -15,8 +15,34 @@ import {
 } from './persistence/persistence'
 import prCommentSetup from './pullrequest/pullRequestComment'
 import { reRunLastWorkFlowIfRequired } from './pullRerunRunner'
+import { octokit } from './octokit'
+
+async function getPRAuthorEmail(username: string): Promise<{ email: string | null }> {
+  try {
+    const userResponse = await octokit.users.getByUsername({
+      username: username
+    })
+    return { email: userResponse.data.email }
+  } catch (error) {
+    core.debug(`Could not fetch email for user ${username}: ${error}`)
+    return { email: null }
+  }
+}
 
 export async function setupClaCheck() {
+  // Step 0: Check if PR author has @silabs.com email domain bypass
+  const prAuthor = context?.payload?.pull_request?.user?.login
+  if (prAuthor) {
+    core.info(`Checking PR author ${prAuthor} for Silabs email domain bypass`)
+    const prAuthorDetails = await getPRAuthorEmail(prAuthor)
+    if (prAuthorDetails.email && prAuthorDetails.email.endsWith('@silabs.com')) {
+      core.info(` PR Author ${prAuthor} has @silabs.com email (${prAuthorDetails.email}) - bypassing CLA check`)
+      return reRunLastWorkFlowIfRequired()
+    } else {
+      core.info(`PR Author ${prAuthor} email: ${prAuthorDetails.email || 'not public'} - continuing with CLA check`)
+    }
+  }
+
   let committerMap = getInitialCommittersMap()
 
   let committers = await getCommitters()
@@ -68,8 +94,7 @@ async function getCLAFileContentandSHA(
       return createClaFileAndPRComment(committers, committerMap)
     } else {
       throw new Error(
-        `Could not retrieve repository contents. Status: ${
-          error.status || 'unknown'
+        `Could not retrieve repository contents. Status: ${error.status || 'unknown'
         }`
       )
     }
@@ -99,8 +124,7 @@ async function createClaFileAndPRComment(
 
   await createFile(initialContentBinary).catch(error =>
     core.setFailed(
-      `Error occurred when creating the signed contributors file: ${
-        error.message || error
+      `Error occurred when creating the signed contributors file: ${error.message || error
       }. Make sure the branch where signatures are stored is NOT protected.`
     )
   )
