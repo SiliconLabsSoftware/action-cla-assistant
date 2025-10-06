@@ -15,8 +15,42 @@ import {
 } from './persistence/persistence'
 import prCommentSetup from './pullrequest/pullRequestComment'
 import { reRunLastWorkFlowIfRequired } from './pullRerunRunner'
+import { getPATOctokit } from './octokit'
+
+const ORG_NAME = 'SiliconLabsSoftware'
+
+async function isOrgMember(username: string, org: string): Promise<boolean> {
+  core.info(`[isOrgMember] Checking if user '${username}' is a member of org '${org}' (private/public)`);
+  try {
+    // Use PAT (GitHub App token) for org membership check as it has the required permissions
+    const patOctokit = getPATOctokit();
+    const response = await patOctokit.orgs.getMembershipForUser({
+      org,
+      username
+    });
+    if (response && response.status === 200 && response.data && response.data.state === 'active') {
+      core.info(`[isOrgMember] User '${username}' is an ACTIVE member of org '${org}'`);
+      return true;
+    }
+    core.info(`[isOrgMember] User '${username}' is NOT an active member of org '${org}'`);
+    return false;
+  } catch (error) {
+    core.info(`[isOrgMember] Error: ${error}`);
+    return false;
+  }
+}
 
 export async function setupClaCheck() {
+  const prAuthor = context?.payload?.pull_request?.user?.login
+  if (prAuthor) {
+    core.info(`Checking PR author ${prAuthor} for ${ORG_NAME} org membership`)
+    const isMember = await isOrgMember(prAuthor, ORG_NAME)
+    if (isMember) {
+      core.info(`PR Author ${prAuthor} is a member of ${ORG_NAME} org - bypassing CLA check`)
+      return reRunLastWorkFlowIfRequired()
+    }
+  }
+
   let committerMap = getInitialCommittersMap()
 
   let committers = await getCommitters()
@@ -44,11 +78,11 @@ export async function setupClaCheck() {
       committerMap?.notSigned === undefined ||
       committerMap.notSigned.length === 0
     ) {
-      core.info(`All contributors have signed the CLA 📝 ✅ `)
+      core.info(`All contributors have signed the CLA `)
       return reRunLastWorkFlowIfRequired()
     } else {
       core.setFailed(
-        `Committers of Pull Request number ${context.issue.number} have to sign the CLA 📝`
+        `Committers of Pull Request number ${context.issue.number} have to sign the CLA `
       )
     }
   } catch (err) {
@@ -68,8 +102,7 @@ async function getCLAFileContentandSHA(
       return createClaFileAndPRComment(committers, committerMap)
     } else {
       throw new Error(
-        `Could not retrieve repository contents. Status: ${
-          error.status || 'unknown'
+        `Could not retrieve repository contents. Status: ${error.status || 'unknown'
         }`
       )
     }
@@ -99,8 +132,7 @@ async function createClaFileAndPRComment(
 
   await createFile(initialContentBinary).catch(error =>
     core.setFailed(
-      `Error occurred when creating the signed contributors file: ${
-        error.message || error
+      `Error occurred when creating the signed contributors file: ${error.message || error
       }. Make sure the branch where signatures are stored is NOT protected.`
     )
   )
