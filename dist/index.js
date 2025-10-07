@@ -985,7 +985,7 @@ function setupClaCheck() {
             core.info(`Checking PR author ${prAuthor} for Silabs email domain bypass`);
             const prAuthorEmail = yield getPRAuthorEmail(prAuthor);
             if (prAuthorEmail && prAuthorEmail.endsWith('@silabs.com')) {
-                core.info(` PR Author ${prAuthor} has @silabs.com email (${prAuthorEmail}) - bypassing CLA check`);
+                core.info(`PR Author ${prAuthor} has @silabs.com email (${prAuthorEmail}) - bypassing CLA check`);
                 return (0, pullRerunRunner_1.reRunLastWorkFlowIfRequired)();
             }
             else {

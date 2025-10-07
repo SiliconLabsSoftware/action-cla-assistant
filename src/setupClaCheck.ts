@@ -36,7 +36,7 @@ export async function setupClaCheck() {
     core.info(`Checking PR author ${prAuthor} for Silabs email domain bypass`)
     const prAuthorEmail = await getPRAuthorEmail(prAuthor)
     if (prAuthorEmail && prAuthorEmail.endsWith('@silabs.com')) {
-      core.info(` PR Author ${prAuthor} has @silabs.com email (${prAuthorEmail}) - bypassing CLA check`)
+      core.info(`PR Author ${prAuthor} has @silabs.com email (${prAuthorEmail}) - bypassing CLA check`)
       return reRunLastWorkFlowIfRequired()
     } else {
       core.info(`PR Author ${prAuthor} email: ${prAuthorEmail || 'not public'} - continuing with CLA check`)
