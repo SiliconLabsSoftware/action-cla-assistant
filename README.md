@@ -1,5 +1,11 @@
 ![build](https://github.com/cla-assistant/github-action/workflows/build/badge.svg)
 
+
+> [!IMPORTANT]
+> **This repository is no longer actively maintained.** I no longer have the bandwidth to maintain this project. The repository has been archived and is now read-only. 
+>
+> You are welcome to **fork this repository** and continue development independently. All existing releases remain functional. Thank you to all contributors and users for your support over the years.
+
 # Handling CLAs and DCOs via GitHub Action
 
 Streamline your workflow and let this GitHub Action (a lite version of [CLA Assistant](https://github.com/cla-assistant/cla-assistant)) handle the legal side of contributions to a repository for you. CLA assistant GitHub action enables contributors to sign CLAs from within a pull request. With this GitHub Action we could get rid of the need for a centrally managed database by **storing the contributor's signature data** in a decentralized way - **in the same repository's file system** or **in a remote repository** which can be even a private repository.
@@ -253,20 +259,27 @@ This PAT should have repo scope and is only required if you have configured to s
         </a>
     </td>
     <td align="center">
+        <a href="https://github.com/aymanbagabas">
+            <img src="https://avatars.githubusercontent.com/u/3187948?v=4" width="100;" alt="aymanbagabas"/>
+            <br />
+            <sub><b>Ayman Bagabas</b></sub>
+        </a>
+    </td>
+    <td align="center">
         <a href="https://github.com/fishcharlie">
             <img src="https://avatars.githubusercontent.com/u/860375?v=4" width="100;" alt="fishcharlie"/>
             <br />
             <sub><b>Charlie Fish</b></sub>
         </a>
-    </td>
+    </td></tr>
+<tr>
     <td align="center">
         <a href="https://github.com/darrellwarde">
             <img src="https://avatars.githubusercontent.com/u/8117355?v=4" width="100;" alt="darrellwarde"/>
             <br />
             <sub><b>Darrell Warde</b></sub>
         </a>
-    </td></tr>
-<tr>
+    </td>
     <td align="center">
         <a href="https://github.com/Holzhaus">
             <img src="https://avatars.githubusercontent.com/u/1834516?v=4" width="100;" alt="Holzhaus"/>
@@ -301,15 +314,15 @@ This PAT should have repo scope and is only required if you have configured to s
             <br />
             <sub><b>Simon Meggle</b></sub>
         </a>
-    </td>
+    </td></tr>
+<tr>
     <td align="center">
         <a href="https://github.com/t8">
             <img src="https://avatars.githubusercontent.com/u/20846869?v=4" width="100;" alt="t8"/>
             <br />
             <sub><b>Tate Berenbaum</b></sub>
         </a>
-    </td></tr>
-<tr>
+    </td>
     <td align="center">
         <a href="https://github.com/Krinkle">
             <img src="https://avatars.githubusercontent.com/u/156867?v=4" width="100;" alt="Krinkle"/>
@@ -344,15 +357,15 @@ This PAT should have repo scope and is only required if you have configured to s
             <br />
             <sub><b>Self Not Found</b></sub>
         </a>
-    </td>
+    </td></tr>
+<tr>
     <td align="center">
         <a href="https://github.com/woxiwangshunlibiye">
             <img src="https://avatars.githubusercontent.com/u/106640041?v=4" width="100;" alt="woxiwangshunlibiye"/>
             <br />
             <sub><b>Woyaoshunlibiye </b></sub>
         </a>
-    </td></tr>
-<tr>
+    </td>
     <td align="center">
         <a href="https://github.com/yahavi">
             <img src="https://avatars.githubusercontent.com/u/11367982?v=4" width="100;" alt="yahavi"/>
