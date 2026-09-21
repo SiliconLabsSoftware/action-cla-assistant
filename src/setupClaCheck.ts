@@ -14,7 +14,7 @@ import {
   updateFile
 } from './persistence/persistence'
 import prCommentSetup from './pullrequest/pullRequestComment'
-import { reRunLastWorkFlowIfRequired } from './pullRerunRunner'
+import { rerunPullRequestWorkflowIfRequired } from './pullRerunRunner'
 import { octokit } from './octokit'
 
 async function getPRAuthorEmail(username: string): Promise<string | null> {
@@ -37,7 +37,7 @@ export async function setupClaCheck() {
     const prAuthorEmail = await getPRAuthorEmail(prAuthor)
     if (prAuthorEmail && prAuthorEmail.endsWith('@silabs.com')) {
       core.info(`PR Author ${prAuthor} has @silabs.com email (${prAuthorEmail}) - bypassing CLA check`)
-      return reRunLastWorkFlowIfRequired()
+      return rerunPullRequestWorkflowIfRequired()
     } else {
       core.info(`PR Author ${prAuthor} email: ${prAuthorEmail || 'not public'} - continuing with CLA check`)
     }
@@ -71,7 +71,7 @@ export async function setupClaCheck() {
       committerMap.notSigned.length === 0
     ) {
       core.info(`All contributors have signed the CLA 📝 ✅ `)
-      return reRunLastWorkFlowIfRequired()
+      return rerunPullRequestWorkflowIfRequired()
     } else {
       core.setFailed(
         `Committers of Pull Request number ${context.issue.number} have to sign the CLA 📝`

@@ -1,12 +1,53 @@
-import * as core from '@actions/core'
-import * as github from '@actions/github'
 import { context } from '@actions/github'
-import { getclas } from '../src/checkcla'
-import { lockPullRequest } from '../src/pullRequestLock'
-import { run } from '../src/main'
-import { mocked } from 'ts-jest/utils'
+import * as core from '@actions/core'
+import { octokit } from '../src/octokit'
+import { lockPullRequest } from '../src/pullrequest/pullRequestLock'
 
 jest.mock('@actions/core')
-jest.mock('@actions/github')
+jest.mock('../src/octokit', () => ({
+  octokit: {
+    issues: {
+      lock: jest.fn()
+    }
+  }
+}))
 
-//const mockedLockPullRequest = mocked(lockPullRequest)
+describe('lockPullRequest', () => {
+  const mockedLock = jest.mocked(octokit.issues.lock)
+
+  beforeEach(() => {
+    jest.clearAllMocks()
+    context.payload = {
+      issue: {
+        number: 17
+      },
+      repository: {
+        name: 'example-repository',
+        owner: {
+          login: 'example-owner'
+        }
+      }
+    }
+  })
+
+  test('locks the current pull request', async () => {
+    await lockPullRequest()
+
+    expect(mockedLock).toHaveBeenCalledWith({
+      owner: 'example-owner',
+      repo: 'example-repository',
+      issue_number: 17
+    })
+  })
+
+  test('reports a lock failure without throwing', async () => {
+    mockedLock.mockImplementationOnce(async () => {
+      throw new Error('lock failed')
+    })
+
+    await expect(lockPullRequest()).resolves.toBeUndefined()
+    expect(core.error).toHaveBeenCalledWith(
+      'failed when locking the pull request '
+    )
+  })
+})
