@@ -6,7 +6,8 @@ export interface CommitterMap {
 export interface ReactedCommitterMap {
     newSigned: CommittersDetails[],
     onlyCommitters?: CommittersDetails[],
-    allSignedFlag: boolean
+    allSignedFlag: boolean,
+    workflowRunIds?: number[]
 }
 export interface CommentedCommitterMap {
     newSigned: CommittersDetails[],

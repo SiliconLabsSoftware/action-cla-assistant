@@ -423,97 +423,255 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
 };
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.rerunPullRequestWorkflowIfRequired = void 0;
+const core = __importStar(__nccwpck_require__(2186));
 const github_1 = __nccwpck_require__(5438);
 const octokit_1 = __nccwpck_require__(3258);
-const core = __importStar(__nccwpck_require__(2186));
+const workflowRunPageSize = 100;
+const maximumWorkflowRunPages = 10;
+const workflowPageSize = 100;
+const maximumWorkflowPages = 10;
+const workflowRunPollIntervalMilliseconds = 2000;
+const maximumWorkflowRunPollAttempts = 30;
+const retryableConclusions = new Set([
+    'failure',
+    'cancelled',
+    'timed_out',
+    'startup_failure',
+    'stale'
+]);
+const completedConclusionsThatDoNotNeedARerun = new Set([
+    'success',
+    'neutral',
+    'skipped'
+]);
 // pull_request_target creates the original CLA check. A later issue_comment
-// event records the signature and reruns that check. Forks often use identical
-// branch names, so branch names alone cannot identify the correct workflow run.
-// See https://github.com/cla-assistant/github-action/issues/39 for why the
-// original failed check must be rerun.
-function rerunPullRequestWorkflowIfRequired() {
+// event records the signature and reruns that exact check. New comments store
+// the original run ID; the strict search below is only for legacy comments.
+function rerunPullRequestWorkflowIfRequired(storedWorkflowRunIds = []) {
     return __awaiter(this, void 0, void 0, function* () {
         if (github_1.context.eventName !== 'issue_comment') {
             core.debug(`rerun not required for event - ${github_1.context.eventName}`);
             return;
         }
-        const headSha = yield getPullRequestHeadSha();
-        const workflowId = yield getSelfWorkflowId();
-        const runs = yield listWorkflowRunsForHeadSha(headSha, workflowId);
-        const workflowRun = runs.data.workflow_runs.find(run => run.head_sha === headSha);
+        const pullRequestIdentity = yield getPullRequestIdentity();
+        const workflowIdentity = yield getWorkflowIdentity();
+        let workflowRun = yield findNewestValidMarkedWorkflowRun(storedWorkflowRunIds, pullRequestIdentity, workflowIdentity);
         if (!workflowRun) {
-            throw new Error(`Unable to locate a workflow run for pull request head SHA ${headSha}`);
+            core.debug('CLA comment has no valid workflow run marker; using strict legacy lookup');
+            const workflowRunId = yield findLegacyWorkflowRunId(pullRequestIdentity, workflowIdentity);
+            workflowRun = yield getWorkflowRun(workflowRunId);
         }
-        const workflowRunFailed = yield checkIfWorkflowRunFailed(workflowRun.id);
-        if (workflowRunFailed) {
-            core.debug(`Rerunning build run ${workflowRun.id}`);
-            yield rerunWorkflow(workflowRun.id);
-        }
+        workflowRun = yield waitForWorkflowRunToComplete(workflowRun, pullRequestIdentity, workflowIdentity);
+        yield rerunWorkflowForConclusion(workflowRun);
     });
 }
 exports.rerunPullRequestWorkflowIfRequired = rerunPullRequestWorkflowIfRequired;
-function getPullRequestHeadSha() {
+function findNewestValidMarkedWorkflowRun(storedWorkflowRunIds, pullRequestIdentity, workflowIdentity) {
+    return __awaiter(this, void 0, void 0, function* () {
+        const uniqueWorkflowRunIds = [...new Set(storedWorkflowRunIds)];
+        const validWorkflowRuns = [];
+        for (const workflowRunId of uniqueWorkflowRunIds) {
+            let workflowRun;
+            try {
+                workflowRun = yield getWorkflowRun(workflowRunId);
+            }
+            catch (error) {
+                if (isNotFoundError(error)) {
+                    core.debug(`Stored workflow run ${workflowRunId} no longer exists; ignoring marker`);
+                    continue;
+                }
+                throw error;
+            }
+            if (workflowRunMatches(workflowRun, pullRequestIdentity, workflowIdentity)) {
+                validWorkflowRuns.push(workflowRun);
+            }
+            else {
+                core.debug(`Stored workflow run ${workflowRunId} does not match the current pull request; ignoring marker`);
+            }
+        }
+        return validWorkflowRuns.sort(compareWorkflowRunsNewestFirst)[0];
+    });
+}
+function isNotFoundError(error) {
+    if (typeof error !== 'object' || error === null || !('status' in error)) {
+        return false;
+    }
+    return error.status === 404;
+}
+function compareWorkflowRunsNewestFirst(left, right) {
+    const runNumberDifference = right.run_number - left.run_number;
+    if (runNumberDifference !== 0) {
+        return runNumberDifference;
+    }
+    const createdAtDifference = Date.parse(right.created_at) - Date.parse(left.created_at);
+    if (createdAtDifference !== 0) {
+        return createdAtDifference;
+    }
+    return right.id - left.id;
+}
+function getPullRequestIdentity() {
+    var _a;
     return __awaiter(this, void 0, void 0, function* () {
         const pullRequest = yield octokit_1.octokit.pulls.get({
             owner: github_1.context.repo.owner,
             repo: github_1.context.repo.repo,
             pull_number: github_1.context.issue.number
         });
-        return pullRequest.data.head.sha;
+        const headRepositoryId = (_a = pullRequest.data.head.repo) === null || _a === void 0 ? void 0 : _a.id;
+        if (!headRepositoryId) {
+            throw new Error(`Pull request ${github_1.context.issue.number} has no accessible head repository`);
+        }
+        return {
+            headBranch: pullRequest.data.head.ref,
+            headRepositoryId,
+            headSha: pullRequest.data.head.sha
+        };
     });
 }
-function getSelfWorkflowId() {
+function getWorkflowIdentity() {
     return __awaiter(this, void 0, void 0, function* () {
-        const perPage = 30;
-        let hasNextPage = true;
-        for (let page = 1; hasNextPage === true; page++) {
-            const workflowList = yield octokit_1.octokit.actions.listRepoWorkflows({
+        const workflowPath = getWorkflowPathFromEnvironment();
+        for (let page = 1; page <= maximumWorkflowPages; page++) {
+            const response = yield octokit_1.octokit.actions.listRepoWorkflows({
                 owner: github_1.context.repo.owner,
                 repo: github_1.context.repo.repo,
-                per_page: perPage,
-                page
+                page,
+                per_page: workflowPageSize
             });
-            if (workflowList.data.total_count < page * perPage) {
-                hasNextPage = false;
-            }
-            const workflow = workflowList.data.workflows.find(w => w.name == github_1.context.workflow);
+            const workflow = response.data.workflows.find(candidate => candidate.path === workflowPath);
             if (workflow) {
-                return workflow.id;
+                return {
+                    id: workflow.id,
+                    path: workflow.path,
+                    url: workflow.url
+                };
+            }
+            if (page * workflowPageSize >= response.data.total_count) {
+                break;
             }
         }
-        throw new Error(`Unable to locate this workflow's ID in this repository, can't trigger job..`);
+        throw new Error(`Unable to locate workflow file ${workflowPath}`);
+    });
+}
+function getWorkflowPathFromEnvironment() {
+    const workflowReference = process.env.GITHUB_WORKFLOW_REF;
+    if (!workflowReference) {
+        throw new Error('GITHUB_WORKFLOW_REF is missing');
+    }
+    const repositoryPrefix = `${github_1.context.repo.owner}/${github_1.context.repo.repo}/`;
+    const refSeparatorIndex = workflowReference.lastIndexOf('@');
+    if (!workflowReference.startsWith(repositoryPrefix) ||
+        refSeparatorIndex <= repositoryPrefix.length) {
+        throw new Error(`GITHUB_WORKFLOW_REF has an unexpected format: ${workflowReference}`);
+    }
+    return workflowReference.slice(repositoryPrefix.length, refSeparatorIndex);
+}
+function findLegacyWorkflowRunId(pullRequestIdentity, workflowIdentity) {
+    return __awaiter(this, void 0, void 0, function* () {
+        const workflowRuns = yield listWorkflowRunsForHeadSha(pullRequestIdentity.headSha, workflowIdentity.id);
+        const candidates = workflowRuns
+            .filter(workflowRun => workflowRunMatches(workflowRun, pullRequestIdentity, workflowIdentity))
+            .sort(compareWorkflowRunsNewestFirst);
+        if (candidates.length === 0) {
+            throw new Error(`Unable to locate a workflow run for pull request ${github_1.context.issue.number}`);
+        }
+        if (candidates.length > 1) {
+            const candidateIds = candidates.map(candidate => candidate.id).join(', ');
+            throw new Error(`Workflow run lookup is ambiguous for pull request ${github_1.context.issue.number}; candidates: ${candidateIds}`);
+        }
+        return candidates[0].id;
     });
 }
 function listWorkflowRunsForHeadSha(headSha, workflowId) {
     return __awaiter(this, void 0, void 0, function* () {
-        const runs = yield octokit_1.octokit.actions.listWorkflowRuns({
-            owner: github_1.context.repo.owner,
-            repo: github_1.context.repo.repo,
-            head_sha: headSha,
-            workflow_id: workflowId,
-            event: 'pull_request_target'
-        });
-        return runs;
+        const workflowRuns = [];
+        let totalCount = 0;
+        for (let page = 1; page <= maximumWorkflowRunPages; page++) {
+            const response = yield octokit_1.octokit.actions.listWorkflowRuns({
+                owner: github_1.context.repo.owner,
+                repo: github_1.context.repo.repo,
+                event: 'pull_request_target',
+                head_sha: headSha,
+                page,
+                per_page: workflowRunPageSize,
+                workflow_id: workflowId
+            });
+            totalCount = response.data.total_count;
+            const pageRuns = response.data.workflow_runs;
+            workflowRuns.push(...pageRuns);
+            if (pageRuns.length < workflowRunPageSize ||
+                workflowRuns.length >= totalCount) {
+                return workflowRuns;
+            }
+        }
+        throw new Error(`Workflow run lookup exceeded ${maximumWorkflowRunPages * workflowRunPageSize} results for head SHA ${headSha}`);
     });
 }
-function rerunWorkflow(run) {
-    return __awaiter(this, void 0, void 0, function* () {
-        // The workflow must grant the GITHUB_TOKEN the actions: write permission.
-        yield octokit_1.octokit.actions.reRunWorkflow({
-            owner: github_1.context.repo.owner,
-            repo: github_1.context.repo.repo,
-            run_id: run
-        });
-    });
-}
-function checkIfWorkflowRunFailed(run) {
+function getWorkflowRun(workflowRunId) {
     return __awaiter(this, void 0, void 0, function* () {
         const response = yield octokit_1.octokit.actions.getWorkflowRun({
             owner: github_1.context.repo.owner,
             repo: github_1.context.repo.repo,
-            run_id: run
+            run_id: workflowRunId
         });
-        return response.data.conclusion === 'failure';
+        return response.data;
+    });
+}
+function validateWorkflowRun(workflowRun, pullRequestIdentity, workflowIdentity) {
+    if (!workflowRunMatches(workflowRun, pullRequestIdentity, workflowIdentity)) {
+        throw new Error(`Workflow run ${workflowRun.id} does not belong to pull request ${github_1.context.issue.number} and workflow ${workflowIdentity.path}`);
+    }
+}
+function waitForWorkflowRunToComplete(initialWorkflowRun, pullRequestIdentity, workflowIdentity) {
+    return __awaiter(this, void 0, void 0, function* () {
+        let workflowRun = initialWorkflowRun;
+        for (let attempt = 1; attempt <= maximumWorkflowRunPollAttempts; attempt++) {
+            validateWorkflowRun(workflowRun, pullRequestIdentity, workflowIdentity);
+            if (workflowRun.status === 'completed') {
+                return workflowRun;
+            }
+            if (attempt === maximumWorkflowRunPollAttempts) {
+                break;
+            }
+            core.debug(`Workflow run ${workflowRun.id} is ${workflowRun.status}; waiting for completion (${attempt}/${maximumWorkflowRunPollAttempts})`);
+            yield wait(workflowRunPollIntervalMilliseconds);
+            workflowRun = yield getWorkflowRun(workflowRun.id);
+        }
+        throw new Error(`Workflow run ${workflowRun.id} did not complete after ${maximumWorkflowRunPollAttempts} checks; status: ${workflowRun.status}`);
+    });
+}
+function wait(milliseconds) {
+    return __awaiter(this, void 0, void 0, function* () {
+        yield new Promise(resolve => setTimeout(resolve, milliseconds));
+    });
+}
+function workflowRunMatches(workflowRun, pullRequestIdentity, workflowIdentity) {
+    var _a;
+    return (workflowRun.event === 'pull_request_target' &&
+        workflowRun.head_branch === pullRequestIdentity.headBranch &&
+        ((_a = workflowRun.head_repository) === null || _a === void 0 ? void 0 : _a.id) ===
+            pullRequestIdentity.headRepositoryId &&
+        workflowRun.head_sha === pullRequestIdentity.headSha &&
+        workflowRun.workflow_url === workflowIdentity.url);
+}
+function rerunWorkflowForConclusion(workflowRun) {
+    return __awaiter(this, void 0, void 0, function* () {
+        if (workflowRun.status !== 'completed' || !workflowRun.conclusion) {
+            throw new Error(`Workflow run ${workflowRun.id} is not completed; status: ${workflowRun.status}`);
+        }
+        if (completedConclusionsThatDoNotNeedARerun.has(workflowRun.conclusion)) {
+            core.debug(`Workflow run ${workflowRun.id} does not require a rerun; conclusion: ${workflowRun.conclusion}`);
+            return;
+        }
+        if (!retryableConclusions.has(workflowRun.conclusion)) {
+            throw new Error(`Workflow run ${workflowRun.id} has unsupported conclusion: ${workflowRun.conclusion}`);
+        }
+        core.debug(`Rerunning workflow run ${workflowRun.id}`);
+        yield octokit_1.octokit.actions.reRunWorkflow({
+            owner: github_1.context.repo.owner,
+            repo: github_1.context.repo.repo,
+            run_id: workflowRun.id
+        });
     });
 }
 
@@ -525,6 +683,29 @@ function checkIfWorkflowRunFailed(run) {
 
 "use strict";
 
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || function (mod) {
+    if (mod && mod.__esModule) return mod;
+    var result = {};
+    if (mod != null) for (var k in mod) if (k !== "default" && Object.prototype.hasOwnProperty.call(mod, k)) __createBinding(result, mod, k);
+    __setModuleDefault(result, mod);
+    return result;
+};
 var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, generator) {
     function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
     return new (P || (P = Promise))(function (resolve, reject) {
@@ -538,28 +719,33 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", ({ value: true }));
+const core = __importStar(__nccwpck_require__(2186));
 const octokit_1 = __nccwpck_require__(3258);
 const github_1 = __nccwpck_require__(5438);
 const signatureComment_1 = __importDefault(__nccwpck_require__(1905));
 const pullRequestCommentContent_1 = __nccwpck_require__(3621);
 const getInputs_1 = __nccwpck_require__(3611);
+const workflowRunMarker_1 = __nccwpck_require__(7223);
+const commentPageSize = 100;
+const maximumCommentPages = 10;
 function prCommentSetup(committerMap, committers) {
     return __awaiter(this, void 0, void 0, function* () {
         const signed = (committerMap === null || committerMap === void 0 ? void 0 : committerMap.notSigned) && (committerMap === null || committerMap === void 0 ? void 0 : committerMap.notSigned.length) === 0;
         try {
-            const claBotComment = yield getComment();
+            const claBotComments = yield getComments();
+            const claBotComment = selectNewestComment(claBotComments);
             if (!claBotComment && !signed) {
                 return createComment(signed, committerMap);
             }
             else if (claBotComment === null || claBotComment === void 0 ? void 0 : claBotComment.id) {
-                if (signed) {
-                    yield updateComment(signed, committerMap, claBotComment);
-                }
                 // reacted committers are contributors who have newly signed by posting the Pull Request comment
                 const reactedCommitters = yield (0, signatureComment_1.default)(committerMap, committers);
                 if (reactedCommitters === null || reactedCommitters === void 0 ? void 0 : reactedCommitters.onlyCommitters) {
                     reactedCommitters.allSignedFlag = prepareAllSignedCommitters(committerMap, reactedCommitters.onlyCommitters, committers);
                 }
+                reactedCommitters.workflowRunIds = claBotComments
+                    .map(comment => (0, workflowRunMarker_1.getWorkflowRunIdFromComment)(comment.body))
+                    .filter((workflowRunId) => !!workflowRunId);
                 committerMap = prepareCommiterMap(committerMap, reactedCommitters);
                 yield updateComment(reactedCommitters.allSignedFlag, committerMap, claBotComment);
                 return reactedCommitters;
@@ -577,37 +763,140 @@ function createComment(signed, committerMap) {
             owner: github_1.context.repo.owner,
             repo: github_1.context.repo.repo,
             issue_number: github_1.context.issue.number,
-            body: (0, pullRequestCommentContent_1.commentContent)(signed, committerMap)
+            body: buildCommentContent(signed, committerMap)
         }).catch(error => { throw new Error(`Error occured when creating a pull request comment: ${error.message}`); });
     });
 }
 function updateComment(signed, committerMap, claBotComment) {
     return __awaiter(this, void 0, void 0, function* () {
+        const latestComment = yield octokit_1.octokit.issues.getComment({
+            owner: github_1.context.repo.owner,
+            repo: github_1.context.repo.repo,
+            comment_id: claBotComment.id
+        });
+        if (yield newerTargetRunAlreadyOwnsComment(latestComment.data.body)) {
+            return;
+        }
         yield octokit_1.octokit.issues.updateComment({
             owner: github_1.context.repo.owner,
             repo: github_1.context.repo.repo,
             comment_id: claBotComment.id,
-            body: (0, pullRequestCommentContent_1.commentContent)(signed, committerMap)
+            body: buildCommentContent(signed, committerMap, latestComment.data.body)
         }).catch(error => { throw new Error(`Error occured when updating the pull request comment: ${error.message}`); });
     });
 }
-function getComment() {
+function newerTargetRunAlreadyOwnsComment(commentBody) {
+    return __awaiter(this, void 0, void 0, function* () {
+        if (github_1.context.eventName !== 'pull_request_target') {
+            return false;
+        }
+        const storedWorkflowRunId = (0, workflowRunMarker_1.getWorkflowRunIdFromComment)(commentBody);
+        if (!storedWorkflowRunId) {
+            return false;
+        }
+        const currentWorkflowRunId = (0, workflowRunMarker_1.parseWorkflowRunId)(process.env.GITHUB_RUN_ID);
+        const currentWorkflowRunNumber = (0, workflowRunMarker_1.parseWorkflowRunId)(process.env.GITHUB_RUN_NUMBER);
+        if (!currentWorkflowRunId || !currentWorkflowRunNumber) {
+            throw new Error('GITHUB_RUN_ID or GITHUB_RUN_NUMBER is missing or invalid');
+        }
+        let storedWorkflowRun;
+        try {
+            storedWorkflowRun = yield octokit_1.octokit.actions.getWorkflowRun({
+                owner: github_1.context.repo.owner,
+                repo: github_1.context.repo.repo,
+                run_id: storedWorkflowRunId
+            });
+        }
+        catch (error) {
+            if (isNotFoundError(error)) {
+                return false;
+            }
+            throw error;
+        }
+        if (storedWorkflowRun.data.run_number <= currentWorkflowRunNumber) {
+            return false;
+        }
+        const currentWorkflowRun = yield octokit_1.octokit.actions.getWorkflowRun({
+            owner: github_1.context.repo.owner,
+            repo: github_1.context.repo.repo,
+            run_id: currentWorkflowRunId
+        });
+        const sameWorkflow = storedWorkflowRun.data.workflow_url ===
+            currentWorkflowRun.data.workflow_url;
+        if (sameWorkflow) {
+            core.debug(`Skipping stale comment update from workflow run ${currentWorkflowRunId}; run ${storedWorkflowRunId} is newer`);
+        }
+        return sameWorkflow;
+    });
+}
+function isNotFoundError(error) {
+    return (typeof error === 'object' &&
+        error !== null &&
+        'status' in error &&
+        error.status === 404);
+}
+function getComments() {
     return __awaiter(this, void 0, void 0, function* () {
         try {
-            const response = yield octokit_1.octokit.issues.listComments({ owner: github_1.context.repo.owner, repo: github_1.context.repo.repo, issue_number: github_1.context.issue.number });
-            //TODO: check the below regex
-            // using a `string` true or false purposely as github action input cannot have a boolean value
-            if ((0, getInputs_1.getUseDcoFlag)() === 'true') {
-                return response.data.find(comment => comment.body.match(/.*DCO Assistant Lite bot.*/m));
+            const botComments = [];
+            for (let page = 1; page <= maximumCommentPages; page++) {
+                const response = yield octokit_1.octokit.issues.listComments({
+                    owner: github_1.context.repo.owner,
+                    repo: github_1.context.repo.repo,
+                    issue_number: github_1.context.issue.number,
+                    page,
+                    per_page: commentPageSize
+                });
+                botComments.push(...response.data.filter(comment => isExpectedAssistantComment(comment)));
+                if (response.data.length < commentPageSize) {
+                    return botComments;
+                }
             }
-            else if ((0, getInputs_1.getUseDcoFlag)() === 'false') {
-                return response.data.find(comment => comment.body.match(/.*CLA Assistant Lite bot.*/m));
-            }
+            throw new Error(`CLA bot comment lookup exceeded ${maximumCommentPages * commentPageSize} comments`);
         }
         catch (error) {
             throw new Error(`Error occured when getting  all the comments of the pull request: ${error.message}`);
         }
     });
+}
+function selectNewestComment(comments) {
+    return comments.reduce((newest, comment) => {
+        if (!newest || comment.id > newest.id) {
+            return comment;
+        }
+        return newest;
+    }, undefined);
+}
+function isGitHubActionsBotComment(comment) {
+    var _a;
+    return ((_a = comment.user) === null || _a === void 0 ? void 0 : _a.login) === 'github-actions[bot]' && !!comment.body;
+}
+function isExpectedAssistantComment(comment) {
+    if (!isGitHubActionsBotComment(comment)) {
+        return false;
+    }
+    // GitHub Action inputs are strings rather than booleans.
+    if ((0, getInputs_1.getUseDcoFlag)() === 'true') {
+        return comment.body.match(/.*DCO Assistant Lite bot.*/m) !== null;
+    }
+    return comment.body.match(/.*CLA Assistant Lite bot.*/m) !== null;
+}
+function buildCommentContent(signed, committerMap, existingCommentBody) {
+    const body = (0, pullRequestCommentContent_1.commentContent)(signed, committerMap);
+    let workflowRunId;
+    if (github_1.context.eventName === 'pull_request_target') {
+        workflowRunId = (0, workflowRunMarker_1.parseWorkflowRunId)(process.env.GITHUB_RUN_ID);
+        if (!workflowRunId) {
+            throw new Error('GITHUB_RUN_ID is missing or invalid');
+        }
+    }
+    else {
+        workflowRunId = (0, workflowRunMarker_1.getWorkflowRunIdFromComment)(existingCommentBody);
+    }
+    if (!workflowRunId) {
+        return body;
+    }
+    return (0, workflowRunMarker_1.addWorkflowRunIdToComment)(body, workflowRunId);
 }
 function prepareCommiterMap(committerMap, reactedCommitters) {
     var _a;
@@ -916,6 +1205,45 @@ function isCommentSignedByUser(comment, commentAuthor) {
 
 /***/ }),
 
+/***/ 7223:
+/***/ ((__unused_webpack_module, exports) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.addWorkflowRunIdToComment = exports.getWorkflowRunIdFromComment = exports.parseWorkflowRunId = void 0;
+const workflowRunMarkerPattern = /<!--\s*cla-assistant-workflow-run-id:\s*(\d+)\s*-->/i;
+const allWorkflowRunMarkersPattern = /<!--\s*cla-assistant-workflow-run-id:\s*\d+\s*-->/gi;
+function parseWorkflowRunId(value) {
+    if (!value || !/^\d+$/.test(value)) {
+        return undefined;
+    }
+    const workflowRunId = Number(value);
+    if (!Number.isSafeInteger(workflowRunId) || workflowRunId <= 0) {
+        return undefined;
+    }
+    return workflowRunId;
+}
+exports.parseWorkflowRunId = parseWorkflowRunId;
+function getWorkflowRunIdFromComment(commentBody) {
+    if (!commentBody) {
+        return undefined;
+    }
+    const markerMatch = workflowRunMarkerPattern.exec(commentBody);
+    return parseWorkflowRunId(markerMatch === null || markerMatch === void 0 ? void 0 : markerMatch[1]);
+}
+exports.getWorkflowRunIdFromComment = getWorkflowRunIdFromComment;
+function addWorkflowRunIdToComment(commentBody, workflowRunId) {
+    const bodyWithoutMarker = commentBody
+        .replace(allWorkflowRunMarkersPattern, '')
+        .replace(/\s+$/, '');
+    return `${bodyWithoutMarker}\n<!-- cla-assistant-workflow-run-id: ${workflowRunId} -->`;
+}
+exports.addWorkflowRunIdToComment = addWorkflowRunIdToComment;
+
+
+/***/ }),
+
 /***/ 8275:
 /***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
 
@@ -1011,7 +1339,7 @@ function setupClaCheck() {
                 (committerMap === null || committerMap === void 0 ? void 0 : committerMap.notSigned) === undefined ||
                 committerMap.notSigned.length === 0) {
                 core.info(`All contributors have signed the CLA 📝 ✅ `);
-                return (0, pullRerunRunner_1.rerunPullRequestWorkflowIfRequired)();
+                return (0, pullRerunRunner_1.rerunPullRequestWorkflowIfRequired)(reactedCommitters === null || reactedCommitters === void 0 ? void 0 : reactedCommitters.workflowRunIds);
             }
             else {
                 core.setFailed(`Committers of Pull Request number ${github_1.context.issue.number} have to sign the CLA 📝`);

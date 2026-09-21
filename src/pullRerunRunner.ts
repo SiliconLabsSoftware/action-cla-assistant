@@ -1,110 +1,411 @@
+import * as core from '@actions/core'
 import { context } from '@actions/github'
 import { octokit } from './octokit'
 
-import * as core from '@actions/core'
+const workflowRunPageSize = 100
+const maximumWorkflowRunPages = 10
+const workflowPageSize = 100
+const maximumWorkflowPages = 10
+const workflowRunPollIntervalMilliseconds = 2000
+const maximumWorkflowRunPollAttempts = 30
+const retryableConclusions = new Set([
+  'failure',
+  'cancelled',
+  'timed_out',
+  'startup_failure',
+  'stale'
+])
+const completedConclusionsThatDoNotNeedARerun = new Set([
+  'success',
+  'neutral',
+  'skipped'
+])
+
+interface PullRequestIdentity {
+  headBranch: string
+  headRepositoryId: number
+  headSha: string
+}
+
+interface WorkflowIdentity {
+  id: number
+  path: string
+  url: string
+}
+
+interface WorkflowRunDetails {
+  conclusion: string | null
+  created_at: string
+  event: string
+  head_branch: string
+  head_repository: {
+    id: number
+  } | null
+  head_sha: string
+  id: number
+  run_number: number
+  status: string
+  workflow_url: string
+}
 
 // pull_request_target creates the original CLA check. A later issue_comment
-// event records the signature and reruns that check. Forks often use identical
-// branch names, so branch names alone cannot identify the correct workflow run.
-// See https://github.com/cla-assistant/github-action/issues/39 for why the
-// original failed check must be rerun.
-export async function rerunPullRequestWorkflowIfRequired() {
+// event records the signature and reruns that exact check. New comments store
+// the original run ID; the strict search below is only for legacy comments.
+export async function rerunPullRequestWorkflowIfRequired(
+  storedWorkflowRunIds: number[] = []
+) {
   if (context.eventName !== 'issue_comment') {
     core.debug(`rerun not required for event - ${context.eventName}`)
     return
   }
 
-  const headSha = await getPullRequestHeadSha()
-  const workflowId = await getSelfWorkflowId()
-  const runs = await listWorkflowRunsForHeadSha(headSha, workflowId)
-  const workflowRun = runs.data.workflow_runs.find(
-    run => run.head_sha === headSha
-  )
+  const pullRequestIdentity = await getPullRequestIdentity()
+  const workflowIdentity = await getWorkflowIdentity()
 
+  let workflowRun = await findNewestValidMarkedWorkflowRun(
+    storedWorkflowRunIds,
+    pullRequestIdentity,
+    workflowIdentity
+  )
   if (!workflowRun) {
-    throw new Error(
-      `Unable to locate a workflow run for pull request head SHA ${headSha}`
+    core.debug(
+      'CLA comment has no valid workflow run marker; using strict legacy lookup'
     )
+    const workflowRunId = await findLegacyWorkflowRunId(
+      pullRequestIdentity,
+      workflowIdentity
+    )
+    workflowRun = await getWorkflowRun(workflowRunId)
   }
 
-  const workflowRunFailed = await checkIfWorkflowRunFailed(
-    workflowRun.id
+  workflowRun = await waitForWorkflowRunToComplete(
+    workflowRun,
+    pullRequestIdentity,
+    workflowIdentity
   )
-  if (workflowRunFailed) {
-    core.debug(`Rerunning build run ${workflowRun.id}`)
-    await rerunWorkflow(workflowRun.id)
-  }
+
+  await rerunWorkflowForConclusion(workflowRun)
 }
 
-async function getPullRequestHeadSha(): Promise<string> {
+async function findNewestValidMarkedWorkflowRun(
+  storedWorkflowRunIds: number[],
+  pullRequestIdentity: PullRequestIdentity,
+  workflowIdentity: WorkflowIdentity
+): Promise<WorkflowRunDetails | undefined> {
+  const uniqueWorkflowRunIds = [...new Set(storedWorkflowRunIds)]
+  const validWorkflowRuns: WorkflowRunDetails[] = []
+
+  for (const workflowRunId of uniqueWorkflowRunIds) {
+    let workflowRun: WorkflowRunDetails
+    try {
+      workflowRun = await getWorkflowRun(workflowRunId)
+    } catch (error) {
+      if (isNotFoundError(error)) {
+        core.debug(
+          `Stored workflow run ${workflowRunId} no longer exists; ignoring marker`
+        )
+        continue
+      }
+      throw error
+    }
+
+    if (
+      workflowRunMatches(
+        workflowRun,
+        pullRequestIdentity,
+        workflowIdentity
+      )
+    ) {
+      validWorkflowRuns.push(workflowRun)
+    } else {
+      core.debug(
+        `Stored workflow run ${workflowRunId} does not match the current pull request; ignoring marker`
+      )
+    }
+  }
+
+  return validWorkflowRuns.sort(compareWorkflowRunsNewestFirst)[0]
+}
+
+function isNotFoundError(error: unknown): boolean {
+  if (typeof error !== 'object' || error === null || !('status' in error)) {
+    return false
+  }
+
+  return error.status === 404
+}
+
+function compareWorkflowRunsNewestFirst(
+  left: WorkflowRunDetails,
+  right: WorkflowRunDetails
+): number {
+  const runNumberDifference = right.run_number - left.run_number
+  if (runNumberDifference !== 0) {
+    return runNumberDifference
+  }
+
+  const createdAtDifference =
+    Date.parse(right.created_at) - Date.parse(left.created_at)
+
+  if (createdAtDifference !== 0) {
+    return createdAtDifference
+  }
+
+  return right.id - left.id
+}
+
+async function getPullRequestIdentity(): Promise<PullRequestIdentity> {
   const pullRequest = await octokit.pulls.get({
     owner: context.repo.owner,
     repo: context.repo.repo,
     pull_number: context.issue.number
   })
 
-  return pullRequest.data.head.sha
+  const headRepositoryId = pullRequest.data.head.repo?.id
+  if (!headRepositoryId) {
+    throw new Error(
+      `Pull request ${context.issue.number} has no accessible head repository`
+    )
+  }
+
+  return {
+    headBranch: pullRequest.data.head.ref,
+    headRepositoryId,
+    headSha: pullRequest.data.head.sha
+  }
 }
 
-async function getSelfWorkflowId(): Promise<number> {
-  const perPage = 30
-  let hasNextPage = true
-
-  for (let page = 1; hasNextPage === true; page++) {
-    const workflowList = await octokit.actions.listRepoWorkflows({
+async function getWorkflowIdentity(): Promise<WorkflowIdentity> {
+  const workflowPath = getWorkflowPathFromEnvironment()
+  for (let page = 1; page <= maximumWorkflowPages; page++) {
+    const response = await octokit.actions.listRepoWorkflows({
       owner: context.repo.owner,
       repo: context.repo.repo,
-      per_page: perPage,
-      page
+      page,
+      per_page: workflowPageSize
     })
-
-    if (workflowList.data.total_count < page * perPage) {
-      hasNextPage = false
-    }
-
-    const workflow = workflowList.data.workflows.find(
-      w => w.name == context.workflow
+    const workflow = response.data.workflows.find(
+      candidate => candidate.path === workflowPath
     )
 
     if (workflow) {
-      return workflow.id
+      return {
+        id: workflow.id,
+        path: workflow.path,
+        url: workflow.url
+      }
+    }
+
+    if (page * workflowPageSize >= response.data.total_count) {
+      break
     }
   }
 
-  throw new Error(
-    `Unable to locate this workflow's ID in this repository, can't trigger job..`
+  throw new Error(`Unable to locate workflow file ${workflowPath}`)
+}
+
+function getWorkflowPathFromEnvironment(): string {
+  const workflowReference = process.env.GITHUB_WORKFLOW_REF
+  if (!workflowReference) {
+    throw new Error('GITHUB_WORKFLOW_REF is missing')
+  }
+
+  const repositoryPrefix = `${context.repo.owner}/${context.repo.repo}/`
+  const refSeparatorIndex = workflowReference.lastIndexOf('@')
+  if (
+    !workflowReference.startsWith(repositoryPrefix) ||
+    refSeparatorIndex <= repositoryPrefix.length
+  ) {
+    throw new Error(
+      `GITHUB_WORKFLOW_REF has an unexpected format: ${workflowReference}`
+    )
+  }
+
+  return workflowReference.slice(repositoryPrefix.length, refSeparatorIndex)
+}
+
+async function findLegacyWorkflowRunId(
+  pullRequestIdentity: PullRequestIdentity,
+  workflowIdentity: WorkflowIdentity
+): Promise<number> {
+  const workflowRuns = await listWorkflowRunsForHeadSha(
+    pullRequestIdentity.headSha,
+    workflowIdentity.id
   )
+  const candidates = workflowRuns
+    .filter(workflowRun =>
+      workflowRunMatches(
+        workflowRun,
+        pullRequestIdentity,
+        workflowIdentity
+      )
+    )
+    .sort(compareWorkflowRunsNewestFirst)
+
+  if (candidates.length === 0) {
+    throw new Error(
+      `Unable to locate a workflow run for pull request ${context.issue.number}`
+    )
+  }
+
+  if (candidates.length > 1) {
+    const candidateIds = candidates.map(candidate => candidate.id).join(', ')
+    throw new Error(
+      `Workflow run lookup is ambiguous for pull request ${context.issue.number}; candidates: ${candidateIds}`
+    )
+  }
+
+  return candidates[0].id
 }
 
 async function listWorkflowRunsForHeadSha(
   headSha: string,
   workflowId: number
-) {
-  const runs = await octokit.actions.listWorkflowRuns({
-    owner: context.repo.owner,
-    repo: context.repo.repo,
-    head_sha: headSha,
-    workflow_id: workflowId,
-    event: 'pull_request_target'
-  })
-  return runs
+): Promise<WorkflowRunDetails[]> {
+  const workflowRuns: WorkflowRunDetails[] = []
+  let totalCount = 0
+
+  for (let page = 1; page <= maximumWorkflowRunPages; page++) {
+    const response = await octokit.actions.listWorkflowRuns({
+      owner: context.repo.owner,
+      repo: context.repo.repo,
+      event: 'pull_request_target',
+      head_sha: headSha,
+      page,
+      per_page: workflowRunPageSize,
+      workflow_id: workflowId
+    })
+
+    totalCount = response.data.total_count
+    const pageRuns = response.data.workflow_runs as WorkflowRunDetails[]
+    workflowRuns.push(...pageRuns)
+
+    if (
+      pageRuns.length < workflowRunPageSize ||
+      workflowRuns.length >= totalCount
+    ) {
+      return workflowRuns
+    }
+  }
+
+  throw new Error(
+    `Workflow run lookup exceeded ${maximumWorkflowRunPages * workflowRunPageSize} results for head SHA ${headSha}`
+  )
 }
 
-async function rerunWorkflow(run: number): Promise<void> {
-  // The workflow must grant the GITHUB_TOKEN the actions: write permission.
-  await octokit.actions.reRunWorkflow({
-    owner: context.repo.owner,
-    repo: context.repo.repo,
-    run_id: run
-  })
-}
-
-async function checkIfWorkflowRunFailed(run: number): Promise<boolean> {
+async function getWorkflowRun(
+  workflowRunId: number
+): Promise<WorkflowRunDetails> {
   const response = await octokit.actions.getWorkflowRun({
     owner: context.repo.owner,
     repo: context.repo.repo,
-    run_id: run
+    run_id: workflowRunId
   })
 
-  return response.data.conclusion === 'failure'
+  return response.data as WorkflowRunDetails
+}
+
+function validateWorkflowRun(
+  workflowRun: WorkflowRunDetails,
+  pullRequestIdentity: PullRequestIdentity,
+  workflowIdentity: WorkflowIdentity
+): void {
+  if (
+    !workflowRunMatches(
+      workflowRun,
+      pullRequestIdentity,
+      workflowIdentity
+    )
+  ) {
+    throw new Error(
+      `Workflow run ${workflowRun.id} does not belong to pull request ${context.issue.number} and workflow ${workflowIdentity.path}`
+    )
+  }
+}
+
+async function waitForWorkflowRunToComplete(
+  initialWorkflowRun: WorkflowRunDetails,
+  pullRequestIdentity: PullRequestIdentity,
+  workflowIdentity: WorkflowIdentity
+): Promise<WorkflowRunDetails> {
+  let workflowRun = initialWorkflowRun
+
+  for (
+    let attempt = 1;
+    attempt <= maximumWorkflowRunPollAttempts;
+    attempt++
+  ) {
+    validateWorkflowRun(
+      workflowRun,
+      pullRequestIdentity,
+      workflowIdentity
+    )
+
+    if (workflowRun.status === 'completed') {
+      return workflowRun
+    }
+
+    if (attempt === maximumWorkflowRunPollAttempts) {
+      break
+    }
+
+    core.debug(
+      `Workflow run ${workflowRun.id} is ${workflowRun.status}; waiting for completion (${attempt}/${maximumWorkflowRunPollAttempts})`
+    )
+    await wait(workflowRunPollIntervalMilliseconds)
+    workflowRun = await getWorkflowRun(workflowRun.id)
+  }
+
+  throw new Error(
+    `Workflow run ${workflowRun.id} did not complete after ${maximumWorkflowRunPollAttempts} checks; status: ${workflowRun.status}`
+  )
+}
+
+async function wait(milliseconds: number): Promise<void> {
+  await new Promise(resolve => setTimeout(resolve, milliseconds))
+}
+
+function workflowRunMatches(
+  workflowRun: WorkflowRunDetails,
+  pullRequestIdentity: PullRequestIdentity,
+  workflowIdentity: WorkflowIdentity
+): boolean {
+  return (
+    workflowRun.event === 'pull_request_target' &&
+    workflowRun.head_branch === pullRequestIdentity.headBranch &&
+    workflowRun.head_repository?.id ===
+      pullRequestIdentity.headRepositoryId &&
+    workflowRun.head_sha === pullRequestIdentity.headSha &&
+    workflowRun.workflow_url === workflowIdentity.url
+  )
+}
+
+async function rerunWorkflowForConclusion(
+  workflowRun: WorkflowRunDetails
+): Promise<void> {
+  if (workflowRun.status !== 'completed' || !workflowRun.conclusion) {
+    throw new Error(
+      `Workflow run ${workflowRun.id} is not completed; status: ${workflowRun.status}`
+    )
+  }
+
+  if (completedConclusionsThatDoNotNeedARerun.has(workflowRun.conclusion)) {
+    core.debug(
+      `Workflow run ${workflowRun.id} does not require a rerun; conclusion: ${workflowRun.conclusion}`
+    )
+    return
+  }
+
+  if (!retryableConclusions.has(workflowRun.conclusion)) {
+    throw new Error(
+      `Workflow run ${workflowRun.id} has unsupported conclusion: ${workflowRun.conclusion}`
+    )
+  }
+
+  core.debug(`Rerunning workflow run ${workflowRun.id}`)
+  await octokit.actions.reRunWorkflow({
+    owner: context.repo.owner,
+    repo: context.repo.repo,
+    run_id: workflowRun.id
+  })
 }
