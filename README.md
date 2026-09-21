@@ -40,10 +40,19 @@ permissions:
 
 jobs:
   CLAAssistant:
+    if: >-
+      github.event_name == 'pull_request_target' ||
+      (github.event_name == 'issue_comment' &&
+       github.event.issue.pull_request &&
+       (github.event.comment.body == 'recheck' ||
+        contains(github.event.comment.body, 'I have read the CLA Document and I hereby sign the CLA')))
+    concurrency:
+      group: cla-assistant-${{ github.event.pull_request.number || github.event.issue.number }}
+      cancel-in-progress: false
+      queue: max
     runs-on: ubuntu-latest
     steps:
       - name: "CLA Assistant"
-        if: ${{ contains(github.event.comment.body, 'I have read the CLA Document and I hereby sign the CLA') }} || github.event_name == 'pull_request_target'
         uses: SiliconLabsWorkflows/cla-assistant@silabs_flavour_v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

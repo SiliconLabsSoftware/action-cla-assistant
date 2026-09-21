@@ -71,7 +71,9 @@ export async function setupClaCheck() {
       committerMap.notSigned.length === 0
     ) {
       core.info(`All contributors have signed the CLA 📝 ✅ `)
-      return rerunPullRequestWorkflowIfRequired()
+      return rerunPullRequestWorkflowIfRequired(
+        reactedCommitters?.workflowRunIds
+      )
     } else {
       core.setFailed(
         `Committers of Pull Request number ${context.issue.number} have to sign the CLA 📝`
