@@ -422,39 +422,44 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
     });
 };
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.reRunLastWorkFlowIfRequired = void 0;
+exports.rerunPullRequestWorkflowIfRequired = void 0;
 const github_1 = __nccwpck_require__(5438);
 const octokit_1 = __nccwpck_require__(3258);
 const core = __importStar(__nccwpck_require__(2186));
-// Note: why this  re-run of the last failed CLA workflow status check is explained this issue https://github.com/cla-assistant/github-action/issues/39
-function reRunLastWorkFlowIfRequired() {
+// pull_request_target creates the original CLA check. A later issue_comment
+// event records the signature and reruns that check. Forks often use identical
+// branch names, so branch names alone cannot identify the correct workflow run.
+// See https://github.com/cla-assistant/github-action/issues/39 for why the
+// original failed check must be rerun.
+function rerunPullRequestWorkflowIfRequired() {
     return __awaiter(this, void 0, void 0, function* () {
-        if (github_1.context.eventName === 'pull_request') {
-            core.debug(`rerun not required for event - pull_request`);
+        if (github_1.context.eventName !== 'issue_comment') {
+            core.debug(`rerun not required for event - ${github_1.context.eventName}`);
             return;
         }
-        const branch = yield getBranchOfPullRequest();
+        const headSha = yield getPullRequestHeadSha();
         const workflowId = yield getSelfWorkflowId();
-        const runs = yield listWorkflowRunsInBranch(branch, workflowId);
-        if (runs.data.total_count > 0) {
-            const run = runs.data.workflow_runs[0].id;
-            const isLastWorkFlowFailed = yield checkIfLastWorkFlowFailed(run);
-            if (isLastWorkFlowFailed) {
-                core.debug(`Rerunning build run ${run}`);
-                yield reRunWorkflow(run).catch(error => core.error(`Error occurred when re-running the workflow: ${error}`));
-            }
+        const runs = yield listWorkflowRunsForHeadSha(headSha, workflowId);
+        const workflowRun = runs.data.workflow_runs.find(run => run.head_sha === headSha);
+        if (!workflowRun) {
+            throw new Error(`Unable to locate a workflow run for pull request head SHA ${headSha}`);
+        }
+        const workflowRunFailed = yield checkIfWorkflowRunFailed(workflowRun.id);
+        if (workflowRunFailed) {
+            core.debug(`Rerunning build run ${workflowRun.id}`);
+            yield rerunWorkflow(workflowRun.id);
         }
     });
 }
-exports.reRunLastWorkFlowIfRequired = reRunLastWorkFlowIfRequired;
-function getBranchOfPullRequest() {
+exports.rerunPullRequestWorkflowIfRequired = rerunPullRequestWorkflowIfRequired;
+function getPullRequestHeadSha() {
     return __awaiter(this, void 0, void 0, function* () {
         const pullRequest = yield octokit_1.octokit.pulls.get({
             owner: github_1.context.repo.owner,
             repo: github_1.context.repo.repo,
             pull_number: github_1.context.issue.number
         });
-        return pullRequest.data.head.ref;
+        return pullRequest.data.head.sha;
     });
 }
 function getSelfWorkflowId() {
@@ -479,22 +484,21 @@ function getSelfWorkflowId() {
         throw new Error(`Unable to locate this workflow's ID in this repository, can't trigger job..`);
     });
 }
-function listWorkflowRunsInBranch(branch, workflowId) {
+function listWorkflowRunsForHeadSha(headSha, workflowId) {
     return __awaiter(this, void 0, void 0, function* () {
-        console.debug(branch);
         const runs = yield octokit_1.octokit.actions.listWorkflowRuns({
             owner: github_1.context.repo.owner,
             repo: github_1.context.repo.repo,
-            branch,
+            head_sha: headSha,
             workflow_id: workflowId,
             event: 'pull_request_target'
         });
         return runs;
     });
 }
-function reRunWorkflow(run) {
+function rerunWorkflow(run) {
     return __awaiter(this, void 0, void 0, function* () {
-        // Personal Access token with repo scope is required to access this api - https://github.community/t/bug-rerun-workflow-api-not-working/126742
+        // The workflow must grant the GITHUB_TOKEN the actions: write permission.
         yield octokit_1.octokit.actions.reRunWorkflow({
             owner: github_1.context.repo.owner,
             repo: github_1.context.repo.repo,
@@ -502,14 +506,14 @@ function reRunWorkflow(run) {
         });
     });
 }
-function checkIfLastWorkFlowFailed(run) {
+function checkIfWorkflowRunFailed(run) {
     return __awaiter(this, void 0, void 0, function* () {
         const response = yield octokit_1.octokit.actions.getWorkflowRun({
             owner: github_1.context.repo.owner,
             repo: github_1.context.repo.repo,
             run_id: run
         });
-        return response.data.conclusion == 'failure';
+        return response.data.conclusion === 'failure';
     });
 }
 
@@ -986,7 +990,7 @@ function setupClaCheck() {
             const prAuthorEmail = yield getPRAuthorEmail(prAuthor);
             if (prAuthorEmail && prAuthorEmail.endsWith('@silabs.com')) {
                 core.info(`PR Author ${prAuthor} has @silabs.com email (${prAuthorEmail}) - bypassing CLA check`);
-                return (0, pullRerunRunner_1.reRunLastWorkFlowIfRequired)();
+                return (0, pullRerunRunner_1.rerunPullRequestWorkflowIfRequired)();
             }
             else {
                 core.info(`PR Author ${prAuthor} email: ${prAuthorEmail || 'not public'} - continuing with CLA check`);
@@ -1007,7 +1011,7 @@ function setupClaCheck() {
                 (committerMap === null || committerMap === void 0 ? void 0 : committerMap.notSigned) === undefined ||
                 committerMap.notSigned.length === 0) {
                 core.info(`All contributors have signed the CLA 📝 ✅ `);
-                return (0, pullRerunRunner_1.reRunLastWorkFlowIfRequired)();
+                return (0, pullRerunRunner_1.rerunPullRequestWorkflowIfRequired)();
             }
             else {
                 core.setFailed(`Committers of Pull Request number ${github_1.context.issue.number} have to sign the CLA 📝`);

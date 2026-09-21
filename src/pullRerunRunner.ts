@@ -3,38 +3,47 @@ import { octokit } from './octokit'
 
 import * as core from '@actions/core'
 
-// Note: why this  re-run of the last failed CLA workflow status check is explained this issue https://github.com/cla-assistant/github-action/issues/39
-export async function reRunLastWorkFlowIfRequired() {
-  if (context.eventName === 'pull_request') {
-    core.debug(`rerun not required for event - pull_request`)
+// pull_request_target creates the original CLA check. A later issue_comment
+// event records the signature and reruns that check. Forks often use identical
+// branch names, so branch names alone cannot identify the correct workflow run.
+// See https://github.com/cla-assistant/github-action/issues/39 for why the
+// original failed check must be rerun.
+export async function rerunPullRequestWorkflowIfRequired() {
+  if (context.eventName !== 'issue_comment') {
+    core.debug(`rerun not required for event - ${context.eventName}`)
     return
   }
 
-  const branch = await getBranchOfPullRequest()
+  const headSha = await getPullRequestHeadSha()
   const workflowId = await getSelfWorkflowId()
-  const runs = await listWorkflowRunsInBranch(branch, workflowId)
+  const runs = await listWorkflowRunsForHeadSha(headSha, workflowId)
+  const workflowRun = runs.data.workflow_runs.find(
+    run => run.head_sha === headSha
+  )
 
-  if (runs.data.total_count > 0) {
-    const run = runs.data.workflow_runs[0].id
+  if (!workflowRun) {
+    throw new Error(
+      `Unable to locate a workflow run for pull request head SHA ${headSha}`
+    )
+  }
 
-    const isLastWorkFlowFailed: boolean = await checkIfLastWorkFlowFailed(run)
-    if (isLastWorkFlowFailed) {
-      core.debug(`Rerunning build run ${run}`)
-      await reRunWorkflow(run).catch(error =>
-        core.error(`Error occurred when re-running the workflow: ${error}`)
-      )
-    }
+  const workflowRunFailed = await checkIfWorkflowRunFailed(
+    workflowRun.id
+  )
+  if (workflowRunFailed) {
+    core.debug(`Rerunning build run ${workflowRun.id}`)
+    await rerunWorkflow(workflowRun.id)
   }
 }
 
-async function getBranchOfPullRequest(): Promise<string> {
+async function getPullRequestHeadSha(): Promise<string> {
   const pullRequest = await octokit.pulls.get({
     owner: context.repo.owner,
     repo: context.repo.repo,
     pull_number: context.issue.number
   })
 
-  return pullRequest.data.head.ref
+  return pullRequest.data.head.sha
 }
 
 async function getSelfWorkflowId(): Promise<number> {
@@ -67,23 +76,22 @@ async function getSelfWorkflowId(): Promise<number> {
   )
 }
 
-async function listWorkflowRunsInBranch(
-  branch: string,
+async function listWorkflowRunsForHeadSha(
+  headSha: string,
   workflowId: number
-): Promise<any> {
-  console.debug(branch)
+) {
   const runs = await octokit.actions.listWorkflowRuns({
     owner: context.repo.owner,
     repo: context.repo.repo,
-    branch,
+    head_sha: headSha,
     workflow_id: workflowId,
     event: 'pull_request_target'
   })
   return runs
 }
 
-async function reRunWorkflow(run: number): Promise<any> {
-  // Personal Access token with repo scope is required to access this api - https://github.community/t/bug-rerun-workflow-api-not-working/126742
+async function rerunWorkflow(run: number): Promise<void> {
+  // The workflow must grant the GITHUB_TOKEN the actions: write permission.
   await octokit.actions.reRunWorkflow({
     owner: context.repo.owner,
     repo: context.repo.repo,
@@ -91,12 +99,12 @@ async function reRunWorkflow(run: number): Promise<any> {
   })
 }
 
-async function checkIfLastWorkFlowFailed(run: number): Promise<boolean> {
-  const response: any = await octokit.actions.getWorkflowRun({
+async function checkIfWorkflowRunFailed(run: number): Promise<boolean> {
+  const response = await octokit.actions.getWorkflowRun({
     owner: context.repo.owner,
     repo: context.repo.repo,
     run_id: run
   })
 
-  return response.data.conclusion == 'failure'
+  return response.data.conclusion === 'failure'
 }
